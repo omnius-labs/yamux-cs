@@ -20,9 +20,10 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <RootNamespace>$(ProjectName)</RootNamespace>
-    <Title>$(ProjectName)</Title>
-    <Description>$(ProjectName)</Description>
+    <RootNamespace>Omnius.$(MSBuildProjectName)</RootNamespace>
+    <Title>Omnius.$(MSBuildProjectName)</Title>
+    <Description>Omnius.$(MSBuildProjectName)</Description>
+    <AssemblyName>Omnius.$(MSBuildProjectName)</AssemblyName>
     <BuildVersion>1</BuildVersion>
     <VersionPrefix>0.0.1</VersionPrefix>
     <VersionSuffix>-alpha</VersionSuffix>
