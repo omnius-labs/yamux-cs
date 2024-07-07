@@ -271,7 +271,7 @@
           "xunit.extensibility.core": "[2.6.6]"
         }
       },
-      "yamux": {
+      "Omnius.Yamux": {
         "type": "Project",
         "dependencies": {
           "Microsoft.Extensions.Logging": "[8.0.0, )",
