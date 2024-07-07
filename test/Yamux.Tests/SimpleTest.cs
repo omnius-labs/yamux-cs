@@ -1,8 +1,8 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using Xunit;
 using Microsoft.Extensions.Logging;
-using System.Diagnostics;
+using Xunit;
 
 namespace Omnius.Yamux;
 
