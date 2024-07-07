@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{A8F1AE8E-A0D2-4DDE-BE0E-3A684F4FA24F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Yamux", "src\Yamux\Yamux.csproj", "{B7479A39-159C-4535-B733-A899B9832F73}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "test", "test", "{9F189339-073E-4DEC-A8B3-C04AAA533F75}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Yamux.Tests", "test\Yamux.Tests\Yamux.Tests.csproj", "{7018E7D6-F227-4CC5-9D77-6E7C27CD010F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B7479A39-159C-4535-B733-A899B9832F73}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B7479A39-159C-4535-B733-A899B9832F73}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B7479A39-159C-4535-B733-A899B9832F73}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B7479A39-159C-4535-B733-A899B9832F73}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7018E7D6-F227-4CC5-9D77-6E7C27CD010F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7018E7D6-F227-4CC5-9D77-6E7C27CD010F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7018E7D6-F227-4CC5-9D77-6E7C27CD010F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7018E7D6-F227-4CC5-9D77-6E7C27CD010F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B7479A39-159C-4535-B733-A899B9832F73} = {A8F1AE8E-A0D2-4DDE-BE0E-3A684F4FA24F}
+		{7018E7D6-F227-4CC5-9D77-6E7C27CD010F} = {9F189339-073E-4DEC-A8B3-C04AAA533F75}
+	EndGlobalSection
+EndGlobal
