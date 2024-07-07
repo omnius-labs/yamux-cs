@@ -7,23 +7,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
-    <InvariantGlobalization>true</InvariantGlobalization>
-    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
-    <NoWarn>CS1591,CS1998,NU5105,NU1603,NU1605</NoWarn>
-    <GenerateFullPaths>true</GenerateFullPaths>
-    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)'))</RepoRoot>
-    <DefineConstants Condition=" '$(StableTest)' == 'true' ">$(DefineConstants);STABLE_TEST</DefineConstants>
-    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
-    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
-    <RestoreLockedMode Condition=" '$(ContinuousIntegrationBuild)' == 'true' ">true</RestoreLockedMode>
-  </PropertyGroup>
 
-  <PropertyGroup>
     <AssemblyName>Omnius.$(MSBuildProjectName)</AssemblyName>
     <RootNamespace>$(AssemblyName)</RootNamespace>
     <Title>$(AssemblyName)</Title>
     <Description>$(AssemblyName)</Description>
-    <NuGetLockFilePath>$(MSBuildThisFileDirectory)\lock\$(RuntimeIdentifier)\$(AssemblyName).json</NuGetLockFilePath>
     <BuildVersion>1</BuildVersion>
     <VersionPrefix>0.0.1</VersionPrefix>
     <VersionSuffix>-alpha</VersionSuffix>
@@ -32,15 +20,27 @@
     <FileVersion>$(AssemblyVersion)</FileVersion>
     <Authors>Lyrise</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/omnius-labs/yamux-cs</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/omnius-labs/yamux-cs</RepositoryUrl>
-    <PackageTags>Core</PackageTags>
-    <Copyright>Copyright (c) 2024 Lyrise</Copyright>
+    <PackageProjectUrl>https://github.com/omnius-labs/lxna</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/omnius-labs/lxna</RepositoryUrl>
+    <PackageTags>Lxna</PackageTags>
+    <Copyright>Copyright (c) 2023 Lyrise</Copyright>
     <RepositoryType>git</RepositoryType>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <DefineConstants Condition=" '$(DesignMode)' != '' ">$(DefineConstants);DESIGN</DefineConstants>
+    <NoWarn>CS1591,CS1998,NU5105,NU1603,NU1605,IDE0008</NoWarn>
+    <GenerateFullPaths>true</GenerateFullPaths>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)'))</RepoRoot>
+    <DefineConstants Condition=" '$(StableTest)' == 'true' ">$(DefineConstants);STABLE_TEST</DefineConstants>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+    <RestoreLockedMode Condition=" '$(ContinuousIntegrationBuild)' == 'true' ">true</RestoreLockedMode>
+    <PublishDocumentationFiles>false</PublishDocumentationFiles>
+    <NuGetLockFilePath>$(MSBuildThisFileDirectory)\lock\$(RuntimeIdentifier)\$(AssemblyName).json</NuGetLockFilePath>
     <PathMap Condition=" '$(Configuration)' == 'Release' ">$(RepoRoot)=.</PathMap>
   </PropertyGroup>
 
