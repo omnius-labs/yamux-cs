@@ -17,7 +17,7 @@ enum StreamState
     Reset
 }
 
-public class YamuxStream : IAsyncDisposable
+public partial class YamuxStream : IAsyncDisposable
 {
     private readonly YamuxMuxer _muxer;
     private readonly uint _streamId;
@@ -51,9 +51,6 @@ public class YamuxStream : IAsyncDisposable
         _receiveBuffer = new CircularBuffer(_bytesPool);
     }
 
-    public YamuxMuxer Muxer => _muxer;
-    public uint StreamId => _streamId;
-
     public async ValueTask DisposeAsync()
     {
         await this.CloseAsync();
@@ -62,7 +59,10 @@ public class YamuxStream : IAsyncDisposable
         _sendEvent.Dispose();
     }
 
-    public async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    public YamuxMuxer Muxer => _muxer;
+    public uint StreamId => _streamId;
+
+    private async ValueTask<int> InternalReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
         if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) return 0;
         if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
@@ -73,7 +73,7 @@ public class YamuxStream : IAsyncDisposable
         return readLength;
     }
 
-    public async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    private async ValueTask InternalWriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
         if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) throw new YamuxException(YamuxErrorCode.StreamClosed);
         if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
@@ -82,12 +82,12 @@ public class YamuxStream : IAsyncDisposable
         int remain = buffer.Length;
         while (remain > 0)
         {
-            var writeLength = await this.InternalWriteAsync(buffer.Slice(buffer.Length - remain), cancellationToken);
+            var writeLength = await this.InternalWriteSubAsync(buffer.Slice(buffer.Length - remain), cancellationToken);
             remain -= writeLength;
         }
     }
 
-    private async ValueTask<int> InternalWriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    private async ValueTask<int> InternalWriteSubAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
         for (; ; )
         {
@@ -275,5 +275,55 @@ public class YamuxStream : IAsyncDisposable
                 _state = StreamState.Reset;
             }
         }
+    }
+}
+
+public partial class YamuxStream : Stream
+{
+    public override bool CanRead => true;
+    public override bool CanWrite => true;
+    public override bool CanSeek => false;
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        return this.ReadAsync(buffer, offset, count).Result;
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        this.WriteAsync(buffer, offset, count).Wait();
+    }
+
+    public override void Flush()
+    {
+        this.FlushAsync().Wait();
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        return await this.InternalReadAsync(buffer.AsMemory(offset, count), cancellationToken);
+    }
+
+    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        await this.InternalWriteAsync(buffer.AsMemory(offset, count), cancellationToken);
     }
 }

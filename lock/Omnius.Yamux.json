@@ -2,6 +2,12 @@
   "version": 2,
   "dependencies": {
     "net8.0": {
+      "Microsoft.Bcl.TimeProvider": {
+        "type": "Direct",
+        "requested": "[9.0.0-preview.7.24405.7, )",
+        "resolved": "9.0.0-preview.7.24405.7",
+        "contentHash": "jFuac/D6rM+wBs+5HpelQDEHBq32ltK+JJkxQjE2CsiNS/jpVUqN2K55mmsOmqrUp9zL63HKtPd02OQukvW/UQ=="
+      },
       "Microsoft.Extensions.Logging": {
         "type": "Direct",
         "requested": "[8.0.0, )",

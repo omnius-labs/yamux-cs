@@ -1,5 +1,7 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Threading.Channels;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using NeoSmart.AsyncLock;
 using Omnius.Yamux.Internal;
@@ -17,6 +19,7 @@ public class YamuxMuxer : IAsyncDisposable
     private readonly YamuxConfig _config;
     private readonly YamuxSessionType _sessionType;
     private readonly Stream _networkStream;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
 
     private readonly ArrayPool<byte> _bytesPool = ArrayPool<byte>.Shared;
@@ -32,7 +35,7 @@ public class YamuxMuxer : IAsyncDisposable
     private readonly Channel<YamuxStream> _acceptedStreams = Channel.CreateUnbounded<YamuxStream>();
 
     private uint _pingId;
-    private readonly Dictionary<uint, TaskCompletionSource> _pingTasks = new();
+    private readonly Dictionary<uint, TaskCompletionSource> _pingTcsMap = new();
     private readonly SemaphoreSlim _pingAckSemaphore = new(1);
     private object _pingLock = new();
 
@@ -45,12 +48,13 @@ public class YamuxMuxer : IAsyncDisposable
 
     private int _closed = 0;
 
-    public YamuxMuxer(YamuxConfig config, YamuxSessionType sessionType, Stream stream, ILogger logger)
+    public YamuxMuxer(YamuxConfig config, YamuxSessionType sessionType, Stream stream, TimeProvider timeProvider, ILogger logger)
     {
         _config = config;
         _config.Verify();
         _sessionType = sessionType;
         _networkStream = stream;
+        _timeProvider = timeProvider;
         _logger = logger;
 
         if (_sessionType == YamuxSessionType.Client) _nextStreamId = 1;
@@ -64,8 +68,6 @@ public class YamuxMuxer : IAsyncDisposable
         }
     }
 
-    public YamuxConfig Config => _config;
-
     public async ValueTask DisposeAsync()
     {
         await this.CloseAsync();
@@ -73,7 +75,20 @@ public class YamuxMuxer : IAsyncDisposable
         _sendSemaphore.Dispose();
     }
 
-    public async ValueTask<YamuxStream> ConnectAsync(CancellationToken cancellationToken = default)
+    public YamuxConfig Config => _config;
+
+    public int StreamCount
+    {
+        get
+        {
+            using (_streamLock.Lock())
+            {
+                return _streams.Count;
+            }
+        }
+    }
+
+    public async ValueTask<YamuxStream> ConnectStreamAsync(CancellationToken cancellationToken = default)
     {
         if (_shutdownErrorCode != YamuxErrorCode.None) throw new YamuxException(_shutdownErrorCode);
         if (_remoteGoAwayCode != GoAwayCode.None) throw new YamuxException(YamuxErrorCode.RemoteGoAway);
@@ -81,7 +96,8 @@ public class YamuxMuxer : IAsyncDisposable
         using (await _connectLock.LockAsync(cancellationToken))
         {
             if (_nextStreamId >= uint.MaxValue - 1) throw new YamuxException(YamuxErrorCode.StreamsExhausted);
-            var streamId = _nextStreamId += 2;
+            var streamId = _nextStreamId;
+            _nextStreamId += 2;
 
             YamuxStream stream;
 
@@ -96,7 +112,7 @@ public class YamuxMuxer : IAsyncDisposable
         }
     }
 
-    public async ValueTask<YamuxStream> AcceptAsync(CancellationToken cancellationToken = default)
+    public async ValueTask<YamuxStream> AcceptStreamAsync(CancellationToken cancellationToken = default)
     {
         if (_shutdownErrorCode != YamuxErrorCode.None) throw new YamuxException(_shutdownErrorCode);
         if (_remoteGoAwayCode != GoAwayCode.None) throw new YamuxException(YamuxErrorCode.RemoteGoAway);
@@ -148,39 +164,47 @@ public class YamuxMuxer : IAsyncDisposable
                 await this.PingAsync(cancellationToken);
             }
         }
+        catch (TimeoutException)
+        {
+            await this.ExitAsync(YamuxErrorCode.Timeout);
+        }
         catch (YamuxException e)
         {
             await this.ExitAsync(e.ErrorCode);
         }
     }
 
-    private async ValueTask PingAsync(CancellationToken cancellationToken = default)
+    public async ValueTask<TimeSpan> PingAsync(CancellationToken cancellationToken = default)
     {
+        var timestamp = _timeProvider.GetTimestamp();
+
         uint pingId;
-        var pingTask = new TaskCompletionSource();
+        var pingTcs = new TaskCompletionSource();
 
         lock (_pingLock)
         {
             pingId = _pingId++;
-            _pingTasks.Add(pingId, pingTask);
+            _pingTcsMap.Add(pingId, pingTcs);
         }
 
         var header = new Header(MessageType.Ping, MessageFlag.SYN, 0, pingId);
         await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
 
-        var timeout = Task.Delay(_config.PingTimeout, cancellationToken);
+        var timeoutTask = _timeProvider.Delay(_config.PingTimeout, cancellationToken);
 
-        var completedTask = await Task.WhenAny(pingTask.Task, timeout);
+        var completedTask = await Task.WhenAny(pingTcs.Task, timeoutTask);
 
         lock (_pingLock)
         {
-            _pingTasks.Remove(pingId);
+            _pingTcsMap.Remove(pingId);
         }
 
-        if (completedTask == timeout)
+        if (completedTask == timeoutTask)
         {
-            throw new YamuxException(YamuxErrorCode.Timeout);
+            throw new TimeoutException();
         }
+
+        return _timeProvider.GetElapsedTime(timestamp);
     }
 
     internal async ValueTask SendFrameAsync(Header header, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
@@ -352,7 +376,7 @@ public class YamuxMuxer : IAsyncDisposable
                 throw new YamuxException(YamuxErrorCode.DuplicateStreamId);
             }
 
-            if (_acceptedStreams.Reader.Count >= _config.MaxAcceptBacklog)
+            if (_acceptedStreams.Reader.Count >= _config.AcceptBacklog)
             {
                 var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, id, 0);
                 await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
@@ -390,7 +414,7 @@ public class YamuxMuxer : IAsyncDisposable
         {
             lock (_pingLock)
             {
-                if (_pingTasks.TryGetValue(pingId, out var task))
+                if (_pingTcsMap.TryGetValue(pingId, out var task))
                 {
                     task.SetResult();
                 }
