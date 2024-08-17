@@ -51,7 +51,12 @@ public partial class YamuxStream : IAsyncDisposable
         _receiveBuffer = new CircularBuffer(_bytesPool);
     }
 
-    public async ValueTask DisposeAsync()
+    protected override void Dispose(bool disposing)
+    {
+        this.DisposeAsync().AsTask().Wait();
+    }
+
+    public new async ValueTask DisposeAsync()
     {
         await this.CloseAsync();
 
