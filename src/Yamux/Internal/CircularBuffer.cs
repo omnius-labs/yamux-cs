@@ -8,8 +8,6 @@ internal class CircularBuffer : IDisposable
     private readonly ArrayPool<byte> _pool;
 
     private readonly LinkedList<Buffer> _buffers = new LinkedList<Buffer>();
-    private readonly ManualResetEventSlim _writeEvent = new ManualResetEventSlim(false);
-    private readonly AsyncLock _lock = new AsyncLock();
 
     public CircularBuffer(ArrayPool<byte> pool)
     {
@@ -33,8 +31,6 @@ internal class CircularBuffer : IDisposable
         }
 
         _buffers.Clear();
-
-        _writeEvent.Dispose();
     }
 
     public class BufferReader
@@ -46,86 +42,63 @@ internal class CircularBuffer : IDisposable
             _cb = cb;
         }
 
-        public void Advance(int count)
+        public bool Available()
         {
-            using (_cb._lock.Lock())
+            this.Shrink();
+
+            if (_cb._buffers.Count == 1)
             {
-                if (count == 0) return;
-                if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
-
                 var buffer = _cb._buffers.First!.Value;
-                if (count > buffer.WrittenBytes - buffer.ReadBytes) throw new InvalidOperationException("Cannot advance past the end of the current buffer");
 
-                buffer.ReadBytes += count;
-
-                this.Shrink();
+                if (buffer.ReadBytes == buffer.WrittenBytes)
+                {
+                    return false;
+                }
             }
+
+            return true;
         }
 
-        public async ValueTask<Memory<byte>> GetMemoryAsync(CancellationToken cancellationToken = default)
+        private void Shrink()
         {
-            for (; ; )
+            if (_cb._buffers.Count > 1)
             {
-                await _cb._writeEvent.WaitHandle.WaitAsync(cancellationToken);
+                var buffer = _cb._buffers.First!.Value;
 
-                using (await _cb._lock.LockAsync(cancellationToken))
+                if (buffer.ReadBytes == buffer.WrittenBytes)
                 {
-                    if (!this.Available())
-                    {
-                        _cb._writeEvent.Reset();
-                        continue;
-                    }
-
-                    var buffer = _cb._buffers.First!.Value;
-                    return new Memory<byte>(buffer.Bytes, buffer.ReadBytes, buffer.WrittenBytes - buffer.ReadBytes);
+                    _cb._pool.Return(buffer.Bytes);
+                    _cb._buffers.RemoveFirst();
                 }
             }
         }
 
-        public async ValueTask<int> ReadAsync(Memory<byte> memory)
+        public int Read(Memory<byte> memory)
         {
-            var buffer = await this.GetMemoryAsync();
+            var buffer = this.GetMemory();
             var readLength = Math.Min(memory.Length, buffer.Length);
             buffer.Slice(0, readLength).CopyTo(memory);
             this.Advance(readLength);
             return readLength;
         }
 
-        private bool Available()
+        private Memory<byte> GetMemory()
         {
-            using (_cb._lock.Lock())
-            {
-                this.Shrink();
-
-                if (_cb._buffers.Count == 1)
-                {
-                    var buffer = _cb._buffers.First!.Value;
-
-                    if (buffer.ReadBytes == buffer.WrittenBytes)
-                    {
-                        return false;
-                    }
-                }
-
-                return true;
-            }
+            var buffer = _cb._buffers.First!.Value;
+            return new Memory<byte>(buffer.Bytes, buffer.ReadBytes, buffer.WrittenBytes - buffer.ReadBytes);
         }
 
-        private void Shrink()
+        private void Advance(int count)
         {
-            using (_cb._lock.Lock())
-            {
-                while (_cb._buffers.Count > 1)
-                {
-                    var buffer = _cb._buffers.First!.Value;
+            if (count == 0) return;
+            if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
 
-                    if (buffer.ReadBytes == buffer.WrittenBytes)
-                    {
-                        _cb._pool.Return(buffer.Bytes);
-                        _cb._buffers.RemoveFirst();
-                    }
-                }
-            }
+            var buffer = _cb._buffers.First!.Value;
+            if (count > buffer.WrittenBytes - buffer.ReadBytes) throw new InvalidOperationException("Cannot advance past the end of the current buffer");
+
+            buffer.ReadBytes += count;
+
+            this.Shrink();
         }
     }
 
@@ -142,63 +115,50 @@ internal class CircularBuffer : IDisposable
 
         public void Advance(int count)
         {
-            using (_cb._lock.Lock())
-            {
-                if (count == 0) return;
-                if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
+            if (count == 0) return;
+            if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
 
-                var buffer = _cb._buffers.Last!.Value;
-                if (count > buffer.Length - buffer.WrittenBytes) throw new InvalidOperationException("Cannot advance past the end of the current buffer");
+            var buffer = _cb._buffers.Last!.Value;
+            if (count > buffer.Length - buffer.WrittenBytes) throw new InvalidOperationException("Cannot advance past the end of the current buffer");
 
-                buffer.WrittenBytes += count;
-                _cb._writeEvent.Set();
-            }
+            buffer.WrittenBytes += count;
         }
 
         public Memory<byte> GetMemory(int sizeHint = 0)
         {
-            using (_cb._lock.Lock())
+            if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
+            if (sizeHint == 0) sizeHint = 1;
+
+            var buffer = _cb._buffers.Last!.Value;
+            if (sizeHint > buffer.Length - buffer.WrittenBytes)
             {
-                if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
-                if (sizeHint == 0) sizeHint = 1;
-
-                var buffer = _cb._buffers.Last!.Value;
-                if (sizeHint > buffer.Length - buffer.WrittenBytes)
-                {
-                    buffer = new Buffer(_cb._pool.Rent(sizeHint));
-                    _cb._buffers.AddLast(buffer);
-                }
-
-                return new Memory<byte>(buffer.Bytes, buffer.WrittenBytes, buffer.Length - buffer.WrittenBytes);
+                buffer = new Buffer(_cb._pool.Rent(sizeHint));
+                _cb._buffers.AddLast(buffer);
             }
+
+            return new Memory<byte>(buffer.Bytes, buffer.WrittenBytes, buffer.Length - buffer.WrittenBytes);
         }
 
         public Span<byte> GetSpan(int sizeHint = 0)
         {
-            using (_cb._lock.Lock())
+            if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
+            if (sizeHint == 0) sizeHint = 1;
+
+            var buffer = _cb._buffers.Last!.Value;
+            if (sizeHint > buffer.Length - buffer.WrittenBytes)
             {
-                if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
-                if (sizeHint == 0) sizeHint = 1;
-
-                var buffer = _cb._buffers.Last!.Value;
-                if (sizeHint > buffer.Length - buffer.WrittenBytes)
-                {
-                    buffer = new Buffer(_cb._pool.Rent(sizeHint));
-                    _cb._buffers.AddLast(buffer);
-                }
-
-                return new Span<byte>(buffer.Bytes, buffer.WrittenBytes, buffer.Length - buffer.WrittenBytes);
+                buffer = new Buffer(_cb._pool.Rent(sizeHint));
+                _cb._buffers.AddLast(buffer);
             }
+
+            return new Span<byte>(buffer.Bytes, buffer.WrittenBytes, buffer.Length - buffer.WrittenBytes);
         }
 
         public void Write(ReadOnlySpan<byte> span)
         {
-            using (_cb._lock.Lock())
-            {
-                var buffer = this.GetSpan(span.Length);
-                span.CopyTo(buffer);
-                this.Advance(span.Length);
-            }
+            var buffer = this.GetSpan(span.Length);
+            span.CopyTo(buffer);
+            this.Advance(span.Length);
         }
     }
 

@@ -20,123 +20,6 @@ public class YamuxMuxerTest : TestBase<YamuxMuxerTest>
     }
 
     [Fact]
-    public async Task PingTest()
-    {
-        var (client, server) = await _testHelper.CreateYamuxMuxerPair(this.Logger);
-
-        await using (client)
-        await using (server)
-        {
-            var clientRTT = await client.PingAsync();
-            Assert.True(clientRTT > TimeSpan.Zero);
-
-            var serverRTT = await server.PingAsync();
-            Assert.True(serverRTT > TimeSpan.Zero);
-        }
-    }
-
-    [Fact]
-    public async Task PingTimeoutTest()
-    {
-        var yamuxConfig = new YamuxConfig() { PingTimeout = TimeSpan.FromSeconds(0) };
-        var timeProvider = new FakeTimeProvider(DateTimeOffset.Parse("2020-01-01T00:00:00Z", CultureInfo.InvariantCulture)) { AutoAdvanceAmount = TimeSpan.FromSeconds(10) };
-
-        var (client, server) = await _testHelper.CreateYamuxMuxerPair(yamuxConfig, timeProvider, this.Logger);
-
-        await using (client)
-        await using (server)
-        {
-            await Assert.ThrowsAsync<TimeoutException>(async () =>
-            {
-                _ = await client.PingAsync();
-            });
-
-            await Assert.ThrowsAsync<TimeoutException>(async () =>
-            {
-                _ = await server.PingAsync();
-            });
-        }
-    }
-
-    [Fact]
-    public async Task CloseBeforeAckTest()
-    {
-        var yamuxConfig = new YamuxConfig() { AcceptBacklog = 8 };
-        var (client, server) = await _testHelper.CreateYamuxMuxerPair(yamuxConfig, this.Logger);
-
-        await using (client)
-        await using (server)
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                var stream = await client.ConnectStreamAsync();
-                await stream.CloseAsync();
-            }
-
-            for (int i = 0; i < 8; i++)
-            {
-                var stream = await server.AcceptStreamAsync();
-                await stream.CloseAsync();
-            }
-
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                var stream = await client.ConnectStreamAsync(cts.Token);
-            }
-        }
-    }
-
-    [Fact]
-    public async Task AcceptTest()
-    {
-        var (client, server) = await _testHelper.CreateYamuxMuxerPair(this.Logger);
-
-        await using (client)
-        await using (server)
-        {
-            Assert.Equal(0, client.StreamCount);
-            Assert.Equal(0, server.StreamCount);
-
-            var tasks = new List<Task>
-            {
-                Task.Run(async () =>
-                {
-                    var stream = await server.AcceptStreamAsync();
-                    Assert.Equal((uint)1, stream.StreamId);
-                    await stream.CloseAsync();
-                }),
-                Task.Run(async () =>
-                {
-                    var stream = await client.AcceptStreamAsync();
-                    Assert.Equal((uint)2, stream.StreamId);
-                    await stream.CloseAsync();
-                }),
-                Task.Run(async () =>
-                {
-                    var stream = await server.ConnectStreamAsync();
-                    Assert.Equal((uint)2, stream.StreamId);
-                    await stream.CloseAsync();
-                }),
-                Task.Run(async () =>
-                {
-                    var stream = await client.ConnectStreamAsync();
-                    Assert.Equal((uint)1, stream.StreamId);
-                    await stream.CloseAsync();
-                })
-            };
-
-            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
-            var completedTask = await Task.WhenAny(Task.WhenAll(tasks), timeoutTask);
-            if (completedTask == timeoutTask)
-            {
-                throw new TimeoutException("timeout");
-            }
-
-            await Task.WhenAll(tasks);
-        }
-    }
-
-    [Fact]
     public async Task RandomTest()
     {
         var (client, server) = await _testHelper.CreateYamuxMuxerPair(this.Logger);
@@ -186,6 +69,158 @@ public class YamuxMuxerTest : TestBase<YamuxMuxerTest>
                     this.Output.WriteLine($"RandomSendAndReceiveTest ({bufferSize}), time: {sb.ElapsedMilliseconds}/ms");
                 }
             }
+        }
+    }
+
+    [Fact]
+    public async Task PingTest()
+    {
+        var (client, server) = await _testHelper.CreateYamuxMuxerPair(this.Logger);
+
+        await using (client)
+        await using (server)
+        {
+            var clientRTT = await client.PingAsync();
+            Assert.True(clientRTT > TimeSpan.Zero);
+
+            var serverRTT = await server.PingAsync();
+            Assert.True(serverRTT > TimeSpan.Zero);
+        }
+    }
+
+    [Fact]
+    public async Task PingTimeoutTest()
+    {
+        var yamuxConfig = new YamuxConfig() { PingTimeout = TimeSpan.FromSeconds(0) };
+        var timeProvider = new FakeTimeProvider(DateTimeOffset.Parse("2020-01-01T00:00:00Z", CultureInfo.InvariantCulture)) { AutoAdvanceAmount = TimeSpan.FromSeconds(10) };
+
+        var (client, server) = await _testHelper.CreateYamuxMuxerPair(yamuxConfig, timeProvider, this.Logger);
+
+        await using (client)
+        await using (server)
+        {
+            await Assert.ThrowsAsync<TimeoutException>(async () =>
+            {
+                _ = await client.PingAsync();
+            });
+
+            await Assert.ThrowsAsync<TimeoutException>(async () =>
+            {
+                _ = await server.PingAsync();
+            });
+        }
+    }
+
+    [Fact]
+    public async Task AcceptTest()
+    {
+        var (client, server) = await _testHelper.CreateYamuxMuxerPair(this.Logger);
+
+        await using (client)
+        await using (server)
+        {
+            Assert.Equal(0, client.StreamCount);
+            Assert.Equal(0, server.StreamCount);
+
+            var tasks = new List<Task>
+            {
+                Task.Run(async () =>
+                {
+                    var stream = await server.AcceptStreamAsync();
+                    Assert.Equal((uint)1, stream.StreamId);
+                    await stream.DisposeAsync();
+                }),
+                Task.Run(async () =>
+                {
+                    var stream = await client.AcceptStreamAsync();
+                    Assert.Equal((uint)2, stream.StreamId);
+                    await stream.DisposeAsync();
+                }),
+                Task.Run(async () =>
+                {
+                    var stream = await server.ConnectStreamAsync();
+                    Assert.Equal((uint)2, stream.StreamId);
+                    await stream.DisposeAsync();
+                }),
+                Task.Run(async () =>
+                {
+                    var stream = await client.ConnectStreamAsync();
+                    Assert.Equal((uint)1, stream.StreamId);
+                    await stream.DisposeAsync();
+                })
+            };
+
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+            var completedTask = await Task.WhenAny(Task.WhenAll(tasks), timeoutTask);
+            if (completedTask == timeoutTask)
+            {
+                throw new TimeoutException("timeout");
+            }
+
+            await Task.WhenAll(tasks);
+        }
+    }
+
+    [Fact]
+    public async Task OpenStreamTimeoutTest()
+    {
+        var (client, server) = await _testHelper.CreateYamuxMuxerPair(this.Logger);
+
+        await using (client)
+        await using (server)
+        {
+            await Assert.ThrowsAsync<TaskCanceledException>(async () =>
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                var stream = await server.ConnectStreamAsync(cts.Token);
+            });
+        }
+    }
+
+    [Fact]
+    public async Task CloseTimeoutTest()
+    {
+        var yamuxConfig = new YamuxConfig() { StreamCloseTimeout = TimeSpan.FromSeconds(0) };
+        var (client, server) = await _testHelper.CreateYamuxMuxerPair(yamuxConfig, this.Logger);
+
+        await using (client)
+        await using (server)
+        {
+            Assert.Equal(0, client.StreamCount);
+            Assert.Equal(0, server.StreamCount);
+
+            Stream? clientStream = null;
+            var tasks = new List<Task>
+            {
+                Task.Run(async () =>
+                {
+                    clientStream = await client.ConnectStreamAsync();
+                }),
+                Task.Run(async () =>
+                {
+                    var stream = await server.AcceptStreamAsync();
+                    await stream.CloseAsync();
+                })
+            };
+
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+            var completedTask = await Task.WhenAny(Task.WhenAll(tasks), timeoutTask);
+            if (completedTask == timeoutTask)
+            {
+                throw new TimeoutException("timeout");
+            }
+
+            await Task.WhenAll(tasks);
+
+            await Task.Delay(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(0, server.StreamCount);
+            Assert.Equal(0, client.StreamCount);
+
+            var exception = await Assert.ThrowsAsync<YamuxException>(async () =>
+            {
+                await clientStream!.WriteAsync("Hello"u8.ToArray());
+            });
         }
     }
 }

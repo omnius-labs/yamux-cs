@@ -1,3 +1,4 @@
+using System;
 using Omnius.Yamux.Internal;
 
 namespace Omnius.Yamux;
@@ -9,6 +10,7 @@ public record YamuxConfig
     public TimeSpan KeepAliveInterval { get; init; } = TimeSpan.FromSeconds(10);
     public uint MaxStreamWindow { get; init; } = 1024 * 1024;
     public TimeSpan PingTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan StreamCloseTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
     public void Verify()
     {

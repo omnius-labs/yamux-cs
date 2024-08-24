@@ -5,7 +5,7 @@ using Omnius.Yamux.Internal;
 
 namespace Omnius.Yamux;
 
-enum StreamState
+public enum StreamState
 {
     Init,
     SYNSent,
@@ -17,13 +17,14 @@ enum StreamState
     Reset
 }
 
-public partial class YamuxStream : IAsyncDisposable
+public partial class YamuxStream
 {
     private readonly YamuxMuxer _muxer;
     private readonly uint _streamId;
     private StreamState _state;
     private readonly AsyncLock _stateLock = new();
     private readonly ArrayPool<byte> _bytesPool;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
 
     private readonly Header _controlHeader = new();
@@ -34,61 +35,97 @@ public partial class YamuxStream : IAsyncDisposable
     private readonly AsyncLock _receiveLock = new();
 
     private uint _sendWindow;
-    private readonly AsyncLock _sendLock = new();
     private readonly Header _sendHeader = new();
+    private readonly AsyncLock _sendLock = new();
+
+    private readonly ManualResetEventSlim _receiveEvent = new ManualResetEventSlim(false);
     private readonly ManualResetEventSlim _sendEvent = new ManualResetEventSlim(false);
+    private readonly ManualResetEventSlim _establishEvent = new ManualResetEventSlim(false);
+
+    private ITimer? _closeTimer;
+
+    private readonly CancellationToken _muxerCancellationToken;
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
 
     private int _closed = 0;
 
-    internal YamuxStream(YamuxMuxer muxer, uint streamId, StreamState state, ArrayPool<byte> bytesPool, ILogger logger)
+    internal YamuxStream(YamuxMuxer muxer, uint streamId, StreamState state, ArrayPool<byte> bytesPool, TimeProvider timeProvider, ILogger logger, CancellationToken muxerCancellationToken)
     {
         _muxer = muxer;
         _streamId = streamId;
         _state = state;
         _bytesPool = bytesPool;
+        _timeProvider = timeProvider;
         _logger = logger;
+        _muxerCancellationToken = muxerCancellationToken;
 
         _receiveBuffer = new CircularBuffer(_bytesPool);
     }
 
-    protected override void Dispose(bool disposing)
-    {
-        this.DisposeAsync().AsTask().Wait();
-    }
-
-    public new async ValueTask DisposeAsync()
-    {
-        await this.CloseAsync();
-
-        _receiveBuffer.Dispose();
-        _sendEvent.Dispose();
-    }
-
     public YamuxMuxer Muxer => _muxer;
     public uint StreamId => _streamId;
+    public StreamState State => _state;
+
+    private CancellationToken GetMixedCancellationToken(CancellationToken cancellationToken = default)
+    {
+        return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _muxerCancellationToken, _cancellationTokenSource.Token).Token;
+    }
+
+    private void NotifyWaiting()
+    {
+        _receiveEvent.Set();
+        _sendEvent.Set();
+        _establishEvent.Set();
+    }
 
     private async ValueTask<int> InternalReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) return 0;
-        if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
         if (buffer.Length == 0) throw new ArgumentOutOfRangeException(nameof(buffer));
 
-        var readLength = await _receiveBuffer.Reader.ReadAsync(buffer);
-        await this.SendWindowUpdateAsync(cancellationToken);
-        return readLength;
+        for (; ; )
+        {
+            if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) return 0;
+            if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
+
+            bool available;
+
+            using (_receiveLock.Lock(cancellationToken))
+            {
+                available = _receiveBuffer.Reader.Available();
+                if (!available) _receiveEvent.Reset();
+            }
+
+            if (!available)
+            {
+                await _receiveEvent.WaitHandle.WaitAsync(cancellationToken);
+                continue;
+            }
+
+            int readLength;
+
+            using (_receiveLock.Lock(cancellationToken))
+            {
+                readLength = _receiveBuffer.Reader.Read(buffer);
+            }
+
+            await this.SendWindowUpdateAsync(cancellationToken);
+
+            return readLength;
+        }
     }
 
     private async ValueTask InternalWriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) throw new YamuxException(YamuxErrorCode.StreamClosed);
-        if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
         if (buffer.Length == 0) throw new ArgumentOutOfRangeException(nameof(buffer));
 
-        int remain = buffer.Length;
-        while (remain > 0)
+        using (await _sendLock.LockAsync(cancellationToken))
         {
-            var writeLength = await this.InternalWriteSubAsync(buffer.Slice(buffer.Length - remain), cancellationToken);
-            remain -= writeLength;
+            int remain = buffer.Length;
+            while (remain > 0)
+            {
+                var writeLength = await this.InternalWriteSubAsync(buffer.Slice(buffer.Length - remain), cancellationToken);
+                remain -= writeLength;
+            }
         }
     }
 
@@ -96,32 +133,31 @@ public partial class YamuxStream : IAsyncDisposable
     {
         for (; ; )
         {
-            await _sendEvent.WaitHandle.WaitAsync(cancellationToken);
+            if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) throw new YamuxException(YamuxErrorCode.StreamClosed);
+            if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
 
-            using (await _sendLock.LockAsync(cancellationToken))
+            if (_sendWindow == 0)
             {
-                var window = _sendWindow;
-                if (window == 0)
-                {
-                    _sendEvent.Reset();
-                    continue;
-                }
-
-                var length = Math.Min((int)window, buffer.Length);
-
-                var flags = this.ComputeSendFlags();
-                _sendHeader.encode(MessageType.Data, flags, _streamId, (uint)length);
-
-                await _muxer.SendFrameAsync(_sendHeader, buffer.Slice(0, length), cancellationToken);
-                Interlocked.Add(ref _sendWindow, (uint)~(length - 1));
-                return length;
+                await _sendEvent.WaitHandle.WaitAsync(cancellationToken);
+                continue;
             }
+
+            var length = Math.Min((int)_sendWindow, buffer.Length);
+
+            var flags = this.ComputeSendFlags();
+            _sendHeader.encode(MessageType.Data, flags, _streamId, (uint)length);
+
+            await _muxer.SendFrameAsync(_sendHeader, buffer.Slice(0, length), cancellationToken);
+            Interlocked.Add(ref _sendWindow, (uint)~(length - 1));
+            return length;
         }
     }
 
     public async ValueTask CloseAsync(CancellationToken cancellationToken = default)
     {
         if (Interlocked.CompareExchange(ref _closed, 1, 0) != 0) return;
+
+        bool removeStream = false;
 
         using (_stateLock.Lock())
         {
@@ -133,25 +169,57 @@ public partial class YamuxStream : IAsyncDisposable
                     _state = StreamState.LocalClose;
                     break;
                 case StreamState.LocalClose:
+                    break;
                 case StreamState.RemoteClose:
                     _state = StreamState.Closed;
+                    removeStream = true;
                     break;
                 case StreamState.Closed:
                     break;
                 case StreamState.Reset:
-                    throw new YamuxException(YamuxErrorCode.StreamReset);
                 default:
                     _logger.LogWarning("yamux: invalid state for close: {0}", _state);
                     throw new YamuxException(YamuxErrorCode.Unexpected);
             }
         }
 
-        var flags = this.ComputeSendFlags();
-        flags |= MessageFlag.FIN;
-        _controlHeader.encode(MessageType.WindowUpdate, flags, _streamId, 0);
-        await _muxer.SendFrameAsync(_controlHeader, default, cancellationToken);
+        _closeTimer?.Dispose();
+        _closeTimer = null;
+
+        if (!removeStream && _muxer.Config.StreamCloseTimeout != Timeout.InfiniteTimeSpan)
+        {
+            _closeTimer = _timeProvider.CreateTimer((_) => this.OnCloseTimeout(), null, _muxer.Config.StreamCloseTimeout, Timeout.InfiniteTimeSpan);
+        }
+
+        using (await _controlHeaderLock.LockAsync(cancellationToken))
+        {
+            var flags = this.ComputeSendFlags();
+            flags |= MessageFlag.FIN;
+            _controlHeader.encode(MessageType.WindowUpdate, flags, _streamId, 0);
+            await _muxer.SendFrameAsync(_controlHeader, default, cancellationToken);
+        }
+
+        this.NotifyWaiting();
+
+        if (removeStream) _muxer.RemoveStream(_streamId);
+    }
+
+    private async void OnCloseTimeout()
+    {
+        this.ForceClose();
 
         _muxer.RemoveStream(_streamId);
+
+        using (_sendLock.Lock())
+        {
+            var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, _streamId, 0);
+            await _muxer.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty);
+        }
+    }
+
+    internal async ValueTask WaitForEstablishedAsync(CancellationToken cancellationToken = default)
+    {
+        await _establishEvent.WaitHandle.WaitAsync(cancellationToken);
     }
 
     internal void ForceClose()
@@ -160,6 +228,8 @@ public partial class YamuxStream : IAsyncDisposable
         {
             _state = StreamState.Closed;
         }
+
+        this.NotifyWaiting();
     }
 
     internal async ValueTask SendWindowUpdateAsync(CancellationToken cancellationToken = default)
@@ -206,11 +276,8 @@ public partial class YamuxStream : IAsyncDisposable
     {
         this.ProcessReceivedFlags(header.Flags);
 
-        using (_sendLock.Lock())
-        {
-            Interlocked.Add(ref _sendWindow, header.Length);
-            _sendEvent.Set();
-        }
+        Interlocked.Add(ref _sendWindow, header.Length);
+        _sendEvent.Set();
     }
 
     internal async ValueTask EnqueueReadBytesAsync(Header header, Stream reader, CancellationToken cancellationToken = default)
@@ -245,6 +312,8 @@ public partial class YamuxStream : IAsyncDisposable
                 _logger.LogError(e, "yamux: stream {0} read error", _streamId);
                 throw new YamuxException(YamuxErrorCode.ConnectionReceiveError);
             }
+
+            _receiveEvent.Set();
         }
     }
 
@@ -252,9 +321,12 @@ public partial class YamuxStream : IAsyncDisposable
     {
         using (_stateLock.Lock())
         {
+            bool removeStream = false;
+
             if (flags.HasFlag(MessageFlag.ACK))
             {
                 if (_state == StreamState.SYNSent) _state = StreamState.Established;
+                _establishEvent.Set();
             }
 
             if (flags.HasFlag(MessageFlag.FIN))
@@ -265,9 +337,12 @@ public partial class YamuxStream : IAsyncDisposable
                     case StreamState.SYNReceived:
                     case StreamState.Established:
                         _state = StreamState.RemoteClose;
+                        this.NotifyWaiting();
                         break;
                     case StreamState.LocalClose:
                         _state = StreamState.Closed;
+                        removeStream = true;
+                        this.NotifyWaiting();
                         break;
                     default:
                         _logger.LogWarning("yamux: invalid state for FIN: {0}", _state);
@@ -278,6 +353,16 @@ public partial class YamuxStream : IAsyncDisposable
             if (flags.HasFlag(MessageFlag.RST))
             {
                 _state = StreamState.Reset;
+                removeStream = true;
+                this.NotifyWaiting();
+            }
+
+            if (removeStream)
+            {
+                _closeTimer?.Dispose();
+                _closeTimer = null;
+
+                _muxer.RemoveStream(_streamId);
             }
         }
     }
@@ -285,6 +370,24 @@ public partial class YamuxStream : IAsyncDisposable
 
 public partial class YamuxStream : Stream
 {
+    protected override void Dispose(bool disposing)
+    {
+        if (!disposing) return;
+        this.DisposeAsync().AsTask().Wait();
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await this.CloseAsync();
+
+        _receiveBuffer.Dispose();
+        _sendEvent.Dispose();
+        _establishEvent.Dispose();
+
+        _cancellationTokenSource.Cancel();
+        _cancellationTokenSource.Dispose();
+    }
+
     public override bool CanRead => true;
     public override bool CanWrite => true;
     public override bool CanSeek => false;
@@ -324,11 +427,15 @@ public partial class YamuxStream : Stream
 
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
+        cancellationToken = this.GetMixedCancellationToken(cancellationToken);
+
         return await this.InternalReadAsync(buffer.AsMemory(offset, count), cancellationToken);
     }
 
     public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
+        cancellationToken = this.GetMixedCancellationToken(cancellationToken);
+
         await this.InternalWriteAsync(buffer.AsMemory(offset, count), cancellationToken);
     }
 }

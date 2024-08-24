@@ -30,21 +30,25 @@ public class YamuxMuxer : IAsyncDisposable
     private uint _nextStreamId;
     private readonly AsyncLock _connectLock = new();
 
-    private readonly SemaphoreSlim _sendSemaphore = new(1);
-
     private readonly Channel<YamuxStream> _acceptedStreams = Channel.CreateUnbounded<YamuxStream>();
+
+    private readonly Task _sendTask;
+    private readonly Channel<SendCommand> _sendCommands = Channel.CreateBounded<SendCommand>(64);
+
+    private readonly Task _receiveTask;
+
+    private Task? _keepAliveTask;
 
     private uint _pingId;
     private readonly Dictionary<uint, TaskCompletionSource> _pingTcsMap = new();
     private readonly SemaphoreSlim _pingAckSemaphore = new(1);
     private object _pingLock = new();
 
-    private readonly Task _receiveTask;
-    private Task? _keepAliveTask;
-
     private GoAwayCode _remoteGoAwayCode = GoAwayCode.None;
     private GoAwayCode _localGoAwayCode = GoAwayCode.None;
     private YamuxErrorCode _shutdownErrorCode;
+
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
 
     private int _closed = 0;
 
@@ -60,11 +64,12 @@ public class YamuxMuxer : IAsyncDisposable
         if (_sessionType == YamuxSessionType.Client) _nextStreamId = 1;
         else _nextStreamId = 2;
 
-        _receiveTask = this.ReceiveLoop();
+        _sendTask = this.SendLoop(_cancellationTokenSource.Token);
+        _receiveTask = this.ReceiveLoop(_cancellationTokenSource.Token);
 
         if (config.EnableKeepAlive)
         {
-            _keepAliveTask = this.KeepAliveLoop();
+            _keepAliveTask = this.KeepAliveLoop(_cancellationTokenSource.Token);
         }
     }
 
@@ -72,7 +77,12 @@ public class YamuxMuxer : IAsyncDisposable
     {
         await this.CloseAsync();
 
-        _sendSemaphore.Dispose();
+        _cancellationTokenSource.Cancel();
+        _cancellationTokenSource.Dispose();
+
+        await _sendTask;
+        await _receiveTask;
+        if (_keepAliveTask != null) await _keepAliveTask;
     }
 
     public YamuxConfig Config => _config;
@@ -88,8 +98,15 @@ public class YamuxMuxer : IAsyncDisposable
         }
     }
 
+    private CancellationToken GetMixedCancellationToken(CancellationToken cancellationToken = default)
+    {
+        return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cancellationTokenSource.Token).Token;
+    }
+
     public async ValueTask<YamuxStream> ConnectStreamAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken = this.GetMixedCancellationToken(cancellationToken);
+
         if (_shutdownErrorCode != YamuxErrorCode.None) throw new YamuxException(_shutdownErrorCode);
         if (_remoteGoAwayCode != GoAwayCode.None) throw new YamuxException(YamuxErrorCode.RemoteGoAway);
 
@@ -103,17 +120,22 @@ public class YamuxMuxer : IAsyncDisposable
 
             using (await _streamLock.LockAsync(cancellationToken))
             {
-                stream = new YamuxStream(this, streamId, StreamState.Init, _bytesPool, _logger);
+                stream = new YamuxStream(this, streamId, StreamState.Init, _bytesPool, _timeProvider, _logger, _cancellationTokenSource.Token);
                 _streams.Add(streamId, stream);
             }
 
             await stream.SendWindowUpdateAsync(cancellationToken);
+
+            await stream.WaitForEstablishedAsync(cancellationToken);
+
             return stream;
         }
     }
 
     public async ValueTask<YamuxStream> AcceptStreamAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken = this.GetMixedCancellationToken(cancellationToken);
+
         if (_shutdownErrorCode != YamuxErrorCode.None) throw new YamuxException(_shutdownErrorCode);
         if (_remoteGoAwayCode != GoAwayCode.None) throw new YamuxException(YamuxErrorCode.RemoteGoAway);
 
@@ -134,22 +156,22 @@ public class YamuxMuxer : IAsyncDisposable
     {
         if (Interlocked.CompareExchange(ref _closed, 1, 0) != 0) return;
 
-        _localGoAwayCode = GoAwayCode.Normal;
-
-        var header = new Header(MessageType.GoAway, MessageFlag.None, 0, (uint)GoAwayCode.Normal);
-        await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty);
-
         _acceptedStreams.Writer.Complete();
-
-        _networkStream.Close();
 
         foreach (var stream in _streams.Values)
         {
             stream.ForceClose();
         }
 
-        await _receiveTask;
-        if (_keepAliveTask != null) await _keepAliveTask;
+        _networkStream.Close();
+    }
+
+    public async ValueTask GoAwayAsync(CancellationToken cancellationToken = default)
+    {
+        _localGoAwayCode = GoAwayCode.Normal;
+
+        var header = new Header(MessageType.GoAway, MessageFlag.None, 0, (uint)GoAwayCode.Normal);
+        await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty);
     }
 
     private async Task KeepAliveLoop(CancellationToken cancellationToken = default)
@@ -164,6 +186,9 @@ public class YamuxMuxer : IAsyncDisposable
                 await this.PingAsync(cancellationToken);
             }
         }
+        catch (OperationCanceledException)
+        {
+        }
         catch (TimeoutException)
         {
             await this.ExitAsync(YamuxErrorCode.Timeout);
@@ -176,6 +201,8 @@ public class YamuxMuxer : IAsyncDisposable
 
     public async ValueTask<TimeSpan> PingAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken = this.GetMixedCancellationToken(cancellationToken);
+
         var timestamp = _timeProvider.GetTimestamp();
 
         uint pingId;
@@ -192,7 +219,7 @@ public class YamuxMuxer : IAsyncDisposable
 
         var timeoutTask = _timeProvider.Delay(_config.PingTimeout, cancellationToken);
 
-        var completedTask = await Task.WhenAny(pingTcs.Task, timeoutTask);
+        var completedTask = await Task.WhenAny(timeoutTask, pingTcs.Task);
 
         lock (_pingLock)
         {
@@ -211,27 +238,61 @@ public class YamuxMuxer : IAsyncDisposable
     {
         await Task.Delay(1, cancellationToken).ConfigureAwait(false);
 
-        await _sendSemaphore.WaitAsync(cancellationToken);
+        var headerBytes = header.GetBytes();
+        var payloadBytes = payload.ToArray();
+        var command = new SendCommand() { Header = headerBytes, Payload = payloadBytes };
 
+        await _sendCommands.Writer.WriteAsync(command, cancellationToken);
+
+        var result = await command.TaskCompletionSource.Task;
+
+        if (result != YamuxErrorCode.None)
+        {
+            throw new YamuxException(result);
+        }
+    }
+
+    internal async ValueTask SendFrameNoWaitAsync(Header header, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    {
+        await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+
+        var headerBytes = header.GetBytes();
+        var payloadBytes = payload.ToArray();
+        var command = new SendCommand() { Header = headerBytes, Payload = payloadBytes };
+
+        await _sendCommands.Writer.WriteAsync(command, cancellationToken);
+    }
+
+    private async Task SendLoop(CancellationToken cancellationToken = default)
+    {
         try
         {
-            await _networkStream.WriteAsync(header.GetBytes(), cancellationToken);
-
-            if (payload.Length > 0)
+            for (; ; )
             {
-                await _networkStream.WriteAsync(payload, cancellationToken);
-            }
+                var command = await _sendCommands.Reader.ReadAsync(cancellationToken);
 
-            await _networkStream.FlushAsync(cancellationToken);
+                try
+                {
+                    await _networkStream.WriteAsync(command.Header, cancellationToken);
+
+                    if (command.Payload.Length > 0)
+                    {
+                        await _networkStream.WriteAsync(command.Payload, cancellationToken);
+                    }
+
+                    await _networkStream.FlushAsync(cancellationToken);
+
+                    command.TaskCompletionSource.SetResult(YamuxErrorCode.None);
+                }
+                catch (Exception e)
+                {
+                    _logger.LogWarning(e, "yamux: failed to send frame");
+                    command.TaskCompletionSource.SetResult(YamuxErrorCode.ConnectionSendError);
+                }
+            }
         }
-        catch (Exception e)
+        catch (OperationCanceledException)
         {
-            _logger.LogWarning(e, "yamux: failed to send frame");
-            throw new YamuxException(YamuxErrorCode.ConnectionSendError);
-        }
-        finally
-        {
-            _sendSemaphore.Release();
         }
     }
 
@@ -265,6 +326,9 @@ public class YamuxMuxer : IAsyncDisposable
                         throw new YamuxException(YamuxErrorCode.InvalidFrameType);
                 }
             }
+        }
+        catch (OperationCanceledException)
+        {
         }
         catch (YamuxException e)
         {
@@ -352,7 +416,7 @@ public class YamuxMuxer : IAsyncDisposable
         {
             _logger.LogWarning(e, "yamux: failed to send go away");
             var header2 = new Header(MessageType.GoAway, MessageFlag.None, 0, (uint)GoAwayCode.ProtocolError);
-            await this.SendFrameAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            await this.SendFrameNoWaitAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
         }
     }
 
@@ -361,25 +425,26 @@ public class YamuxMuxer : IAsyncDisposable
         if (_localGoAwayCode != GoAwayCode.None)
         {
             var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, id, 0);
-            await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            await this.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
             return;
         }
 
-        var stream = new YamuxStream(this, id, StreamState.SYNReceived, _bytesPool, _logger);
+        var stream = new YamuxStream(this, id, StreamState.SYNReceived, _bytesPool, _timeProvider, _logger, _cancellationTokenSource.Token);
 
         using (await _streamLock.LockAsync(cancellationToken))
         {
+            // Check if stream already exists
             if (_streams.ContainsKey(id))
             {
                 var header = new Header(MessageType.GoAway, MessageFlag.None, 0, (uint)GoAwayCode.ProtocolError);
-                await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                await this.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
                 throw new YamuxException(YamuxErrorCode.DuplicateStreamId);
             }
 
             if (_acceptedStreams.Reader.Count >= _config.AcceptBacklog)
             {
                 var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, id, 0);
-                await this.SendFrameAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                await this.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
                 return;
             }
 
@@ -401,7 +466,7 @@ public class YamuxMuxer : IAsyncDisposable
                 try
                 {
                     var header2 = new Header(MessageType.Ping, MessageFlag.ACK, 0, pingId);
-                    await this.SendFrameAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                    await this.SendFrameNoWaitAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
                 }
                 finally
                 {
@@ -448,5 +513,12 @@ public class YamuxMuxer : IAsyncDisposable
         if (_shutdownErrorCode != YamuxErrorCode.None) return;
         _shutdownErrorCode = errorCode;
         await this.CloseAsync();
+    }
+
+    private record SendCommand
+    {
+        public required byte[] Header { get; init; }
+        public required byte[] Payload { get; init; }
+        public TaskCompletionSource<YamuxErrorCode> TaskCompletionSource { get; } = new();
     }
 }
