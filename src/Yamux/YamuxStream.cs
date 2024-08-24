@@ -37,15 +37,15 @@ public partial class YamuxStream
     private uint _sendWindow;
     private readonly Header _sendHeader = new();
     private readonly AsyncLock _sendLock = new();
+    private readonly AsyncLock _sendWindowLock = new();
 
     private readonly ManualResetEventSlim _receiveEvent = new ManualResetEventSlim(false);
     private readonly ManualResetEventSlim _sendEvent = new ManualResetEventSlim(false);
     private readonly ManualResetEventSlim _establishEvent = new ManualResetEventSlim(false);
-
     private ITimer? _closeTimer;
 
     private readonly CancellationToken _muxerCancellationToken;
-    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private readonly CancellationTokenSource _streamCancellationTokenSource = new();
 
     private int _closed = 0;
 
@@ -68,7 +68,7 @@ public partial class YamuxStream
 
     private CancellationToken GetMixedCancellationToken(CancellationToken cancellationToken = default)
     {
-        return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _muxerCancellationToken, _cancellationTokenSource.Token).Token;
+        return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _streamCancellationTokenSource.Token, _muxerCancellationToken).Token;
     }
 
     private void NotifyWaiting()
@@ -76,6 +76,11 @@ public partial class YamuxStream
         _receiveEvent.Set();
         _sendEvent.Set();
         _establishEvent.Set();
+    }
+
+    internal async ValueTask WaitForEstablishedAsync(CancellationToken cancellationToken = default)
+    {
+        await _establishEvent.WaitHandle.WaitAsync(cancellationToken);
     }
 
     private async ValueTask<int> InternalReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
@@ -136,19 +141,32 @@ public partial class YamuxStream
             if (_state == StreamState.LocalClose || _state == StreamState.RemoteClose || _state == StreamState.Closed) throw new YamuxException(YamuxErrorCode.StreamClosed);
             if (_state == StreamState.Reset) throw new YamuxException(YamuxErrorCode.StreamReset);
 
-            if (_sendWindow == 0)
+            uint sendWindow;
+
+            using (_sendWindowLock.Lock())
+            {
+                sendWindow = _sendWindow;
+                if (sendWindow == 0) _sendEvent.Reset();
+            }
+
+            if (sendWindow == 0)
             {
                 await _sendEvent.WaitHandle.WaitAsync(cancellationToken);
                 continue;
             }
 
-            var length = Math.Min((int)_sendWindow, buffer.Length);
+            var length = Math.Min((int)sendWindow, buffer.Length);
 
             var flags = this.ComputeSendFlags();
             _sendHeader.encode(MessageType.Data, flags, _streamId, (uint)length);
 
             await _muxer.SendFrameAsync(_sendHeader, buffer.Slice(0, length), cancellationToken);
-            Interlocked.Add(ref _sendWindow, (uint)~(length - 1));
+
+            using (_sendWindowLock.Lock())
+            {
+                _sendWindow -= (uint)length;
+            }
+
             return length;
         }
     }
@@ -213,13 +231,8 @@ public partial class YamuxStream
         using (_sendLock.Lock())
         {
             var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, _streamId, 0);
-            await _muxer.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty);
+            await _muxer.SendFrameFireAndForgetAsync(header, ReadOnlyMemory<byte>.Empty);
         }
-    }
-
-    internal async ValueTask WaitForEstablishedAsync(CancellationToken cancellationToken = default)
-    {
-        await _establishEvent.WaitHandle.WaitAsync(cancellationToken);
     }
 
     internal void ForceClose()
@@ -276,8 +289,11 @@ public partial class YamuxStream
     {
         this.ProcessReceivedFlags(header.Flags);
 
-        Interlocked.Add(ref _sendWindow, header.Length);
-        _sendEvent.Set();
+        using (_sendWindowLock.Lock())
+        {
+            _sendWindow += header.Length;
+            _sendEvent.Set();
+        }
     }
 
     internal async ValueTask EnqueueReadBytesAsync(Header header, Stream reader, CancellationToken cancellationToken = default)
@@ -301,7 +317,7 @@ public partial class YamuxStream
             {
                 while (remain > 0)
                 {
-                    var readLength = await reader.ReadAsync(buffer.Slice((int)header.Length - remain, remain));
+                    var readLength = await reader.ReadAsync(buffer.Slice((int)header.Length - remain, remain), cancellationToken);
                     _receiveBuffer.Writer.Advance(readLength);
                     _receiveWindow -= (uint)readLength;
                     remain -= readLength;
@@ -321,6 +337,7 @@ public partial class YamuxStream
     {
         using (_stateLock.Lock())
         {
+
             bool removeStream = false;
 
             if (flags.HasFlag(MessageFlag.ACK))
@@ -384,8 +401,8 @@ public partial class YamuxStream : Stream
         _sendEvent.Dispose();
         _establishEvent.Dispose();
 
-        _cancellationTokenSource.Cancel();
-        _cancellationTokenSource.Dispose();
+        _streamCancellationTokenSource.Cancel();
+        _streamCancellationTokenSource.Dispose();
     }
 
     public override bool CanRead => true;

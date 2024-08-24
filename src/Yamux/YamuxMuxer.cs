@@ -252,7 +252,7 @@ public class YamuxMuxer : IAsyncDisposable
         }
     }
 
-    internal async ValueTask SendFrameNoWaitAsync(Header header, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    internal async ValueTask SendFrameFireAndForgetAsync(Header header, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
     {
         await Task.Delay(1, cancellationToken).ConfigureAwait(false);
 
@@ -291,9 +291,17 @@ public class YamuxMuxer : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException e)
         {
+            _logger.LogInformation(e, "yamux: send loop canceled");
         }
+    }
+
+    private record SendCommand
+    {
+        public required byte[] Header { get; init; }
+        public required byte[] Payload { get; init; }
+        public TaskCompletionSource<YamuxErrorCode> TaskCompletionSource { get; } = new();
     }
 
     private async Task ReceiveLoop(CancellationToken cancellationToken = default)
@@ -327,8 +335,9 @@ public class YamuxMuxer : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException e)
         {
+            _logger.LogInformation(e, "yamux: receive loop canceled");
         }
         catch (YamuxException e)
         {
@@ -416,7 +425,7 @@ public class YamuxMuxer : IAsyncDisposable
         {
             _logger.LogWarning(e, "yamux: failed to send go away");
             var header2 = new Header(MessageType.GoAway, MessageFlag.None, 0, (uint)GoAwayCode.ProtocolError);
-            await this.SendFrameNoWaitAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            await this.SendFrameFireAndForgetAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
         }
     }
 
@@ -425,7 +434,7 @@ public class YamuxMuxer : IAsyncDisposable
         if (_localGoAwayCode != GoAwayCode.None)
         {
             var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, id, 0);
-            await this.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            await this.SendFrameFireAndForgetAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
             return;
         }
 
@@ -437,14 +446,14 @@ public class YamuxMuxer : IAsyncDisposable
             if (_streams.ContainsKey(id))
             {
                 var header = new Header(MessageType.GoAway, MessageFlag.None, 0, (uint)GoAwayCode.ProtocolError);
-                await this.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                await this.SendFrameFireAndForgetAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
                 throw new YamuxException(YamuxErrorCode.DuplicateStreamId);
             }
 
             if (_acceptedStreams.Reader.Count >= _config.AcceptBacklog)
             {
                 var header = new Header(MessageType.WindowUpdate, MessageFlag.RST, id, 0);
-                await this.SendFrameNoWaitAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                await this.SendFrameFireAndForgetAsync(header, ReadOnlyMemory<byte>.Empty, cancellationToken);
                 return;
             }
 
@@ -466,7 +475,7 @@ public class YamuxMuxer : IAsyncDisposable
                 try
                 {
                     var header2 = new Header(MessageType.Ping, MessageFlag.ACK, 0, pingId);
-                    await this.SendFrameNoWaitAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
+                    await this.SendFrameFireAndForgetAsync(header2, ReadOnlyMemory<byte>.Empty, cancellationToken);
                 }
                 finally
                 {
@@ -513,12 +522,5 @@ public class YamuxMuxer : IAsyncDisposable
         if (_shutdownErrorCode != YamuxErrorCode.None) return;
         _shutdownErrorCode = errorCode;
         await this.CloseAsync();
-    }
-
-    private record SendCommand
-    {
-        public required byte[] Header { get; init; }
-        public required byte[] Payload { get; init; }
-        public TaskCompletionSource<YamuxErrorCode> TaskCompletionSource { get; } = new();
     }
 }
